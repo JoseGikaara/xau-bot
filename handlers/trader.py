@@ -19,6 +19,8 @@ CALC_BALANCE, CALC_RISK = range(2, 4)
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     get_or_create_user(user.id, user.username or "")
+    # Clear any stuck conversation state
+    context.user_data.clear()
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 I want to trade (Trader Mode)", callback_data="mode_trader")],
         [InlineKeyboardButton("📢 I run a signal group (Seller Mode)", callback_data="mode_seller")],
@@ -38,6 +40,12 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
 
+    if query.data == "mode_seller":
+        set_user_mode(user_id, "seller")
+        from handlers.seller import show_seller_menu
+        await show_seller_menu(update, context, via_callback=True)
+        return
+
     if query.data == "mode_trader":
         set_user_mode(user_id, "trader")
         await query.edit_message_text(
@@ -46,50 +54,48 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "_(e.g. 500 or 1000)_",
             parse_mode=ParseMode.MARKDOWN,
         )
-        context.user_data["state"] = "ASK_BALANCE"
-
-    elif query.data == "mode_seller":
-        set_user_mode(user_id, "seller")
-        from handlers.seller import show_seller_menu
-        await show_seller_menu(update, context, via_callback=True)
+        context.user_data["awaiting"] = "balance"
 
 
-async def ask_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        balance = float(update.message.text.replace(",", "").replace("$", "").strip())
-    except ValueError:
-        await update.message.reply_text("Please enter a number, e.g. 500")
-        return ASK_BALANCE
-    context.user_data["balance"] = balance
-    context.user_data["state"] = "ASK_RISK"
-    await update.message.reply_text(
-        f"✅ Balance: *${balance:,.2f}*\n\nWhat risk % per trade? (e.g. 1 or 2)",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    return ASK_RISK
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Routes text messages based on what we're waiting for."""
+    awaiting = context.user_data.get("awaiting")
+    text = update.message.text.strip()
 
+    if awaiting == "balance":
+        try:
+            balance = float(text.replace(",", "").replace("$", ""))
+            context.user_data["balance"] = balance
+            context.user_data["awaiting"] = "risk"
+            await update.message.reply_text(
+                f"✅ Balance: *${balance:,.2f}*\n\nWhat risk % per trade? (e.g. 1 or 2)",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except ValueError:
+            await update.message.reply_text("Please enter a number, e.g. 500")
+        return True
 
-async def ask_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        risk = float(update.message.text.replace("%", "").strip())
-        if not (0.1 <= risk <= 10):
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Enter a number between 0.1 and 10")
-        return ASK_RISK
-    user_id = update.effective_user.id
-    balance = context.user_data.get("balance", 0)
-    set_user_account(user_id, balance, risk)
-    context.user_data["state"] = None
-    await update.message.reply_text(
-        f"✅ *Account configured!*\n\n"
-        f"💰 Balance: *${balance:,.2f}*\n"
-        f"⚡ Risk: *{risk}%* = ${balance * risk / 100:,.2f} max loss\n\n"
-        "Choose an option 👇",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=trader_keyboard(),
-    )
-    return ConversationHandler.END
+    if awaiting == "risk":
+        try:
+            risk = float(text.replace("%", ""))
+            if not (0.1 <= risk <= 10):
+                raise ValueError
+            balance = context.user_data.get("balance", 0)
+            set_user_account(update.effective_user.id, balance, risk)
+            context.user_data["awaiting"] = None
+            await update.message.reply_text(
+                f"✅ *Account configured!*\n\n"
+                f"💰 Balance: *${balance:,.2f}*\n"
+                f"⚡ Risk: *{risk}%*\n\n"
+                "Choose an option 👇",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=trader_keyboard(),
+            )
+        except ValueError:
+            await update.message.reply_text("Enter a number between 0.1 and 10, e.g. 1")
+        return True
+
+    return False
 
 
 def trader_keyboard() -> ReplyKeyboardMarkup:
@@ -112,39 +118,9 @@ async def get_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def risk_calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting"] = "calc_balance"
     await update.message.reply_text("🧮 *Risk Calculator*\n\nEnter your balance in USD:",
                                      parse_mode=ParseMode.MARKDOWN)
-    return CALC_BALANCE
-
-
-async def risk_calc_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        balance = float(update.message.text.replace(",", "").replace("$", "").strip())
-    except ValueError:
-        await update.message.reply_text("Enter a valid number.")
-        return CALC_BALANCE
-    context.user_data["calc_balance"] = balance
-    await update.message.reply_text("Now enter your risk % (e.g. 1 or 2):")
-    return CALC_RISK
-
-
-async def risk_calc_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        risk = float(update.message.text.replace("%", "").strip())
-    except ValueError:
-        await update.message.reply_text("Enter a valid number.")
-        return CALC_RISK
-    balance = context.user_data.get("calc_balance", 0)
-    lot_size, max_loss = calculate_lots_only(balance, risk)
-    await update.message.reply_text(
-        f"🧮 *Risk Calculator Result*\n━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Balance: *${balance:,.2f}*\n"
-        f"⚡ Risk: *{risk}%* = *${balance * risk / 100:,.2f}*\n\n"
-        f"📊 Lot size: *{lot_size}*\n"
-        f"💸 Max loss: *${max_loss:,.2f}*",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    return ConversationHandler.END
 
 
 async def learn_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -155,7 +131,7 @@ async def learn_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*When to trade:*\n✅ 10:00am – 1:00pm EAT\n"
         "❌ Avoid Fridays after 12pm\n❌ Avoid NFP, Fed, CPI news\n\n"
         "*Entry rules:*\n1. Identify Asian range high and low\n"
-        "2. Enter BUY above Asian high OR SELL below Asian low\n"
+        "2. BUY above Asian high OR SELL below Asian low\n"
         "3. SL = 15 pips, TP1 = 1:1, TP2 = 1:2\n"
         "4. Move SL to break-even when TP1 hits\n\n"
         "_Pro members get live signals at 7:05am EAT every weekday._",
@@ -173,7 +149,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚡ Risk %: *{user.get('risk_pct', 1.0)}%*\n"
         f"🎯 Mode: *{user.get('mode', 'not set').title()}*\n"
         f"👑 Plan: *{get_user_tier(user_id).title()}*\n\n"
-        "To update, type /start and set up again",
+        "To change mode or reset, type /start",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -189,24 +165,18 @@ async def my_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def get_setup_conversation():
+    # Dummy — kept for import compatibility, not used
     return ConversationHandler(
-        entry_points=[CallbackQueryHandler(mode_callback, pattern="^mode_")],
-        states={
-            ASK_BALANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_balance)],
-            ASK_RISK:    [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_risk)],
-        },
-        fallbacks=[CommandHandler("start", start_command)],
-        per_message=False,
-        per_chat=True,
+        entry_points=[CommandHandler("noop_setup", start_command)],
+        states={},
+        fallbacks=[],
     )
 
 
 def get_calc_conversation():
+    # Dummy — kept for import compatibility, not used
     return ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🧮 Risk Calculator$"), risk_calc_start)],
-        states={
-            CALC_BALANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, risk_calc_balance)],
-            CALC_RISK:    [MessageHandler(filters.TEXT & ~filters.COMMAND, risk_calc_result)],
-        },
-        fallbacks=[CommandHandler("start", start_command)],
+        entry_points=[CommandHandler("noop_calc", start_command)],
+        states={},
+        fallbacks=[],
     )

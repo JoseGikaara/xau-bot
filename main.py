@@ -13,14 +13,14 @@ from telegram.ext import (
 from config.settings import BOT_TOKEN
 from handlers.trader import (
     start_command, get_signal, learn_strategy, settings, my_plan,
-    get_setup_conversation, get_calc_conversation, mode_callback,
+    mode_callback, risk_calc_start,
 )
 from handlers.seller import (
     post_signal_to_channel, signal_history, guide_command,
     faq_listener, mygroup_command, setvip_command,
     post_confirm_callback, post_results_callback,
-    close_command, results_command,
-    get_channel_conversation, get_format_conversation,
+    close_command, results_command, format_signal_start,
+    connect_channel,
 )
 from handlers.master import (
     activate_command, suspend_command, clients_command,
@@ -36,23 +36,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── Tiny web server so Render doesn't kill us ─────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
     def log_message(self, format, *args):
-        pass  # silence access logs
+        pass
 
 def start_health_server():
     server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logger.info("Health server running on port 8080")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logger.info("Health server on port 8080")
 
 
-# ── Bot ───────────────────────────────────────────────────────
 async def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN not set in .env")
@@ -61,6 +58,7 @@ async def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Commands
     app.add_handler(CommandHandler("start",     start_command))
     app.add_handler(CommandHandler("guide",     guide_command))
     app.add_handler(CommandHandler("mygroup",   mygroup_command))
@@ -75,31 +73,34 @@ async def main():
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("grantpro",  grantpro_command))
 
-    app.add_handler(get_setup_conversation())
-    app.add_handler(get_calc_conversation())
-    app.add_handler(get_channel_conversation())
-    app.add_handler(get_format_conversation())
+    # Inline button callbacks
+    app.add_handler(CallbackQueryHandler(mode_callback,         pattern=r"^mode_"))
+    app.add_handler(CallbackQueryHandler(post_confirm_callback, pattern=r"^post_confirm\|"))
+    app.add_handler(CallbackQueryHandler(post_confirm_callback, pattern=r"^post_cancel$"))
+    app.add_handler(CallbackQueryHandler(post_results_callback, pattern=r"^post_results$"))
 
-    app.add_handler(CallbackQueryHandler(mode_callback,          pattern=r"^mode_"))
-    app.add_handler(CallbackQueryHandler(post_confirm_callback,  pattern=r"^post_confirm\|"))
-    app.add_handler(CallbackQueryHandler(post_confirm_callback,  pattern=r"^post_cancel$"))
-    app.add_handler(CallbackQueryHandler(post_results_callback,  pattern=r"^post_results$"))
+    # Keyboard buttons — trader
+    app.add_handler(MessageHandler(filters.Regex("^📊 Get Signal$"),     get_signal))
+    app.add_handler(MessageHandler(filters.Regex("^🧮 Risk Calculator$"), risk_calc_start))
+    app.add_handler(MessageHandler(filters.Regex("^📚 Learn Strategy$"), learn_strategy))
+    app.add_handler(MessageHandler(filters.Regex("^⚙️ Settings$"),       settings))
+    app.add_handler(MessageHandler(filters.Regex("^💰 My Plan$"),         my_plan))
 
-    app.add_handler(MessageHandler(filters.Regex("^📊 Get Signal$"),             get_signal))
-    app.add_handler(MessageHandler(filters.Regex("^📚 Learn Strategy$"),         learn_strategy))
-    app.add_handler(MessageHandler(filters.Regex("^⚙️ Settings$"),               settings))
-    app.add_handler(MessageHandler(filters.Regex("^💰 My Plan$"),                 my_plan))
-    app.add_handler(MessageHandler(filters.Regex("^📡 Post Signal to Channel$"), post_signal_to_channel))
-    app.add_handler(MessageHandler(filters.Regex("^📊 Signal History$"),         signal_history))
-    app.add_handler(MessageHandler(filters.Regex("^📈 Results$"),                results_command))
-    app.add_handler(MessageHandler(filters.Regex("^⚙️ My Settings$"),            settings))
-    app.add_handler(MessageHandler(filters.Regex("^📖 Guide$"),                  guide_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,              faq_listener))
+    # Keyboard buttons — seller
+    app.add_handler(MessageHandler(filters.Regex("^🔗 Connect Channel$"),          connect_channel))
+    app.add_handler(MessageHandler(filters.Regex("^📡 Post Signal to Channel$"),   post_signal_to_channel))
+    app.add_handler(MessageHandler(filters.Regex("^📋 Format Signal$"),            format_signal_start))
+    app.add_handler(MessageHandler(filters.Regex("^📊 Signal History$"),           signal_history))
+    app.add_handler(MessageHandler(filters.Regex("^📈 Results$"),                  results_command))
+    app.add_handler(MessageHandler(filters.Regex("^⚙️ My Settings$"),              settings))
+    app.add_handler(MessageHandler(filters.Regex("^📖 Guide$"),                    guide_command))
+
+    # Catch-all text handler (FAQs + multi-step flows)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, faq_listener))
 
     setup_scheduler(app)
 
     logger.info("🤖 XAU Bot running. Press Ctrl+C to stop.")
-
     await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=["message", "callback_query"])
